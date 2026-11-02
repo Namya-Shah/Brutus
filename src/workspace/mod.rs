@@ -69,11 +69,79 @@ impl WorkspaceManager {
             anyhow::bail!("Base path is not a git repository: {}", base_path.display());
         }
 
-        Ok(Self {
-            base_path,
-            base_branch,
+        let manager = Self {
+            base_path: base_path.clone(),
+            base_branch: base_branch.clone(),
             worktrees: parking_lot::RwLock::new(Vec::new()),
-        })
+        };
+
+        // Discover any existing git worktrees
+        manager.discover_worktrees();
+
+        Ok(manager)
+    }
+
+    fn discover_worktrees(&self) {
+        let output = Command::new("git")
+            .args(["worktree", "list", "--porcelain"])
+            .current_dir(&self.base_path)
+            .output();
+
+        let Ok(output) = output else { return };
+        if !output.status.success() { return }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut current_path: Option<PathBuf> = None;
+        let mut current_branch: Option<String> = None;
+
+        for line in stdout.lines() {
+            if let Some(path_str) = line.strip_prefix("worktree ") {
+                current_path = Some(PathBuf::from(path_str));
+            } else if let Some(branch_str) = line.strip_prefix("branch refs/heads/") {
+                current_branch = Some(branch_str.to_string());
+            } else if line.is_empty() {
+                if let (Some(path), Some(branch)) = (current_path.take(), current_branch.take()) {
+                    if path != self.base_path {
+                        let name = path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| branch.clone());
+                        let wt = Worktree {
+                            id: Uuid::new_v4(),
+                            name,
+                            path,
+                            branch,
+                            base_branch: self.base_branch.clone(),
+                            created_at: chrono::Utc::now(),
+                            agent_type: None,
+                            status: WorktreeStatus::Ready,
+                        };
+                        self.worktrees.write().push(wt);
+                    }
+                }
+            }
+        }
+
+        // Final entry if trailing newline wasn't empty
+        if let (Some(path), Some(branch)) = (current_path, current_branch) {
+            if path != self.base_path {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| branch.clone());
+                let wt = Worktree {
+                    id: Uuid::new_v4(),
+                    name,
+                    path,
+                    branch,
+                    base_branch: self.base_branch.clone(),
+                    created_at: chrono::Utc::now(),
+                    agent_type: None,
+                    status: WorktreeStatus::Ready,
+                };
+                self.worktrees.write().push(wt);
+            }
+        }
     }
 
     pub async fn create_worktree(
@@ -87,11 +155,13 @@ impl WorkspaceManager {
         let worktree_path = self.base_path.join(".brutus").join(&name);
 
         if worktree_path.exists() {
-            tokio::fs::remove_dir_all(&worktree_path).await
+            tokio::fs::remove_dir_all(&worktree_path)
+                .await
                 .context("Failed to remove existing worktree directory")?;
         }
 
-        tokio::fs::create_dir_all(worktree_path.parent().unwrap()).await
+        tokio::fs::create_dir_all(worktree_path.parent().unwrap())
+            .await
             .context("Failed to create .brutus directory")?;
 
         let mut worktree = Worktree {
@@ -155,7 +225,12 @@ impl WorkspaceManager {
         self.update_worktree(&worktree);
 
         let output = TokioCommand::new("git")
-            .args(["worktree", "remove", "--force", &worktree.path.to_string_lossy()])
+            .args([
+                "worktree",
+                "remove",
+                "--force",
+                &worktree.path.to_string_lossy(),
+            ])
             .current_dir(&self.base_path)
             .output()
             .await
@@ -167,7 +242,8 @@ impl WorkspaceManager {
         }
 
         if worktree.path.exists() {
-            tokio::fs::remove_dir_all(&worktree.path).await
+            tokio::fs::remove_dir_all(&worktree.path)
+                .await
                 .context("Failed to remove worktree directory")?;
         }
 
@@ -176,6 +252,15 @@ impl WorkspaceManager {
             worktrees.retain(|w| w.id != id);
         }
 
+        Ok(())
+    }
+
+    pub fn open_worktree_dir(&self, id: Uuid) -> Result<()> {
+        let worktree = self
+            .get_worktree(id)
+            .ok_or_else(|| anyhow::anyhow!("Worktree not found: {}", id))?;
+
+        open::that(&worktree.path).context("Failed to open directory in file manager")?;
         Ok(())
     }
 
@@ -202,7 +287,8 @@ impl WorkspaceManager {
         command: Vec<String>,
         env_vars: Vec<(String, String)>,
     ) -> Result<tokio::process::Child> {
-        let worktree = self.get_worktree(id)
+        let worktree = self
+            .get_worktree(id)
             .ok_or_else(|| anyhow::anyhow!("Worktree not found: {}", id))?;
 
         let mut cmd = TokioCommand::new(&command[0]);

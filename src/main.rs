@@ -1,20 +1,12 @@
 use anyhow::Result;
 use clap::Parser;
-use crossterm::{
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-};
-use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
-use std::io::stdout;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::signal;
-use tracing_subscriber::{EnvFilter, fmt};
+use tracing_subscriber::{fmt, EnvFilter};
 
 use brutus::agent::runner::AgentRunner;
 use brutus::diff::tracker::DiffTracker;
-use brutus::tui::app::{App, run_app};
+use brutus::gui::app::{run_gui, BrutusApp};
 use brutus::workspace::WorkspaceManager;
 
 #[derive(Parser, Debug)]
@@ -37,8 +29,7 @@ struct Args {
     debug: bool,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let args = Args::parse();
 
     init_logging(args.debug);
@@ -46,8 +37,14 @@ async fn main() -> Result<()> {
     let base_path = std::fs::canonicalize(&args.path)
         .map_err(|e| anyhow::anyhow!("Failed to canonicalize path {}: {}", args.path.display(), e))?;
 
-    tracing::info!("Starting Brutus with base path: {}", base_path.display());
+    tracing::info!("Starting Brutus GUI with base path: {}", base_path.display());
     tracing::info!("Base branch: {}", args.branch);
+
+    // Build Tokio runtime for background async services (agent process watchers, diff filesystem events)
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let _guard = rt.enter();
 
     let workspace_manager = Arc::new(WorkspaceManager::new(&base_path, args.branch.clone())?);
     let agent_runner = Arc::new(AgentRunner::new(args.max_output_lines));
@@ -60,29 +57,14 @@ async fn main() -> Result<()> {
         }
     });
 
-    enable_raw_mode()?;
-    execute!(stdout(), EnterAlternateScreen)?;
+    let app = BrutusApp::new(
+        workspace_manager,
+        agent_runner,
+        diff_tracker,
+    );
 
-    let backend = CrosstermBackend::new(stdout());
-    let mut terminal = Terminal::new(backend)?;
-
-    let app = App::new(workspace_manager.clone(), agent_runner.clone(), diff_tracker.clone());
-
-    let app_handle = tokio::spawn(async move {
-        run_app(&mut terminal, app).await
-    });
-
-    tokio::select! {
-        result = app_handle => {
-            result??;
-        }
-        _ = signal::ctrl_c() => {
-            tracing::info!("Received Ctrl-C, shutting down...");
-        }
-    }
-
-    disable_raw_mode()?;
-    execute!(stdout(), LeaveAlternateScreen)?;
+    // Launch cross-platform native GUI on the main thread
+    run_gui(app)?;
 
     tracing::info!("Brutus shutdown complete");
     Ok(())
@@ -95,11 +77,11 @@ fn init_logging(debug: bool) {
         EnvFilter::new("info")
     };
 
-    fmt()
+    let _ = fmt()
         .with_env_filter(filter)
         .with_target(false)
         .with_thread_ids(true)
         .with_file(true)
         .with_line_number(true)
-        .init();
+        .try_init();
 }

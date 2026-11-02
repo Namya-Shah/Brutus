@@ -1,9 +1,10 @@
 use anyhow::{Context, Result};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::process::Command as TokioCommand;
+use tokio::sync::{mpsc, Mutex as TokioMutex};
 use tracing::{debug, error, info, warn};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,11 +49,13 @@ pub struct WorktreeDiff {
     pub total_deletions: usize,
 }
 
+#[derive(Clone)]
 pub struct DiffTracker {
-    watchers: parking_lot::RwLock<Vec<(uuid::Uuid, RecommendedWatcher)>>,
-    diffs: Arc<RwLock<Vec<WorktreeDiff>>>,
+    watchers: Arc<parking_lot::RwLock<Vec<(uuid::Uuid, RecommendedWatcher)>>>,
+    worktree_paths: Arc<parking_lot::RwLock<HashMap<uuid::Uuid, PathBuf>>>,
+    diffs: Arc<parking_lot::RwLock<Vec<WorktreeDiff>>>,
     tx: mpsc::UnboundedSender<DiffEvent>,
-    rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<DiffEvent>>>>,
+    rx: Arc<TokioMutex<Option<mpsc::UnboundedReceiver<DiffEvent>>>>,
 }
 
 #[derive(Debug)]
@@ -66,10 +69,11 @@ impl DiffTracker {
     pub fn new() -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         Self {
-            watchers: parking_lot::RwLock::new(Vec::new()),
-            diffs: Arc::new(RwLock::new(Vec::new())),
+            watchers: Arc::new(parking_lot::RwLock::new(Vec::new())),
+            worktree_paths: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            diffs: Arc::new(parking_lot::RwLock::new(Vec::new())),
             tx,
-            rx: Arc::new(Mutex::new(Some(rx))),
+            rx: Arc::new(TokioMutex::new(Some(rx))),
         }
     }
 
@@ -80,25 +84,30 @@ impl DiffTracker {
     pub async fn start_watching(&self, worktree_id: uuid::Uuid, path: PathBuf) -> Result<()> {
         let tx = self.tx.clone();
 
+        self.worktree_paths.write().insert(worktree_id, path.clone());
+
         let mut watcher = RecommendedWatcher::new(
-            move |res: Result<Event, notify::Error>| {
-                match res {
-                    Ok(event) => {
-                        if matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)) {
-                            for path in event.paths {
-                                if path.extension().map_or(true, |ext| ext != "git") {
-                                    let _ = tx.send(DiffEvent::FileChanged(worktree_id, path));
-                                }
+            move |res: Result<Event, notify::Error>| match res {
+                Ok(event) => {
+                    if matches!(
+                        event.kind,
+                        EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
+                    ) {
+                        for p in event.paths {
+                            if p.extension().map_or(true, |ext| ext != "git") {
+                                let _ = tx.send(DiffEvent::FileChanged(worktree_id, p));
                             }
                         }
                     }
-                    Err(e) => warn!("Watcher error for worktree {}: {}", worktree_id, e),
                 }
+                Err(e) => warn!("Watcher error for worktree {}: {}", worktree_id, e),
             },
             notify::Config::default(),
-        ).context("Failed to create file watcher")?;
+        )
+        .context("Failed to create file watcher")?;
 
-        watcher.watch(&path, RecursiveMode::Recursive)
+        watcher
+            .watch(&path, RecursiveMode::Recursive)
             .context("Failed to watch worktree path")?;
 
         {
@@ -107,22 +116,30 @@ impl DiffTracker {
         }
 
         info!("Started watching worktree {} at {}", worktree_id, path.display());
+
+        // Queue initial diff calculation
+        let _ = self.tx.send(DiffEvent::RefreshRequested(worktree_id));
+
         Ok(())
     }
 
     pub async fn stop_watching(&self, worktree_id: uuid::Uuid) -> Result<()> {
         let watcher = {
             let mut watchers = self.watchers.write();
-            watchers.iter().position(|(id, _)| *id == worktree_id)
+            watchers
+                .iter()
+                .position(|(id, _)| *id == worktree_id)
                 .map(|idx| watchers.remove(idx).1)
         };
 
         if let Some(mut watcher) = watcher {
-            watcher.unwatch(&std::path::Path::new(".")).context("Failed to unwatch paths")?;
+            let _ = watcher.unwatch(Path::new("."));
         }
 
+        self.worktree_paths.write().remove(&worktree_id);
+
         {
-            let mut diffs = self.diffs.write().await;
+            let mut diffs = self.diffs.write();
             diffs.retain(|d| d.worktree_id != worktree_id);
         }
 
@@ -153,9 +170,8 @@ impl DiffTracker {
                 total_additions += additions;
                 total_deletions += deletions;
 
-                let status = self.get_file_status(path, &file_path).await?;
-
-                let diff_output = self.get_file_diff(path, &file_path).await?;
+                let status = self.get_file_status(path, &file_path).await.unwrap_or(DiffStatus::Modified);
+                let diff_output = self.get_file_diff(path, &file_path).await.unwrap_or_default();
 
                 files.push(FileDiff {
                     path: file_path,
@@ -167,14 +183,17 @@ impl DiffTracker {
             }
         }
 
-        let untracked = self.get_untracked_files(path).await?;
+        let untracked = self.get_untracked_files(path).await.unwrap_or_default();
         for file_path in untracked {
+            let diff_output = self.get_untracked_file_content(path, &file_path).await.unwrap_or_default();
+            let additions = diff_output.lines().count();
+            total_additions += additions;
             files.push(FileDiff {
                 path: file_path,
                 status: DiffStatus::Untracked,
-                additions: 0,
+                additions,
                 deletions: 0,
-                diff_output: String::new(),
+                diff_output,
             });
         }
 
@@ -244,10 +263,26 @@ impl DiffTracker {
         Ok(files)
     }
 
+    async fn get_untracked_file_content(&self, repo_path: &Path, file_path: &Path) -> Result<String> {
+        let full_path = repo_path.join(file_path);
+        if full_path.is_file() {
+            let content = tokio::fs::read_to_string(&full_path).await?;
+            let mut diff = format!("--- /dev/null\n+++ b/{}\n", file_path.display());
+            for line in content.lines() {
+                diff.push('+');
+                diff.push_str(line);
+                diff.push('\n');
+            }
+            Ok(diff)
+        } else {
+            Ok(String::new())
+        }
+    }
+
     pub async fn update_diff(&self, worktree_id: uuid::Uuid, path: &Path) -> Result<()> {
         let diff = self.compute_diff(worktree_id, path).await?;
-        let mut diffs = self.diffs.write().await;
-        
+        let mut diffs = self.diffs.write();
+
         if let Some(idx) = diffs.iter().position(|d| d.worktree_id == worktree_id) {
             diffs[idx] = diff;
         } else {
@@ -257,26 +292,36 @@ impl DiffTracker {
         Ok(())
     }
 
-    pub async fn get_diff(&self, worktree_id: uuid::Uuid) -> Option<WorktreeDiff> {
-        let diffs = self.diffs.read().await;
+    pub fn get_diff(&self, worktree_id: uuid::Uuid) -> Option<WorktreeDiff> {
+        let diffs = self.diffs.read();
         diffs.iter().find(|d| d.worktree_id == worktree_id).cloned()
     }
 
-    pub async fn get_all_diffs(&self) -> Vec<WorktreeDiff> {
-        let diffs = self.diffs.read().await;
+    pub fn get_all_diffs(&self) -> Vec<WorktreeDiff> {
+        let diffs = self.diffs.read();
         diffs.clone()
     }
 
+    pub fn get_worktree_path(&self, worktree_id: uuid::Uuid) -> Option<PathBuf> {
+        self.worktree_paths.read().get(&worktree_id).cloned()
+    }
+
     pub async fn run_event_loop(&self) -> Result<()> {
-        let mut rx = self.rx.lock().await.take()
+        let mut rx = self
+            .rx
+            .lock()
+            .await
+            .take()
             .ok_or_else(|| anyhow::anyhow!("Event loop already running"))?;
 
         while let Some(event) = rx.recv().await {
             match event {
-                DiffEvent::FileChanged(worktree_id, path) => {
-                    debug!("File changed in worktree {}: {}", worktree_id, path.display());
-                    if let Err(e) = self.update_diff(worktree_id, &path).await {
-                        error!("Failed to update diff for worktree {}: {}", worktree_id, e);
+                DiffEvent::FileChanged(worktree_id, _) => {
+                    if let Some(worktree_dir) = self.get_worktree_path(worktree_id) {
+                        debug!("Updating diff for worktree {}: {}", worktree_id, worktree_dir.display());
+                        if let Err(e) = self.update_diff(worktree_id, &worktree_dir).await {
+                            error!("Failed to update diff for worktree {}: {}", worktree_id, e);
+                        }
                     }
                 }
                 DiffEvent::WorktreeRemoved(worktree_id) => {
@@ -285,8 +330,8 @@ impl DiffTracker {
                     }
                 }
                 DiffEvent::RefreshRequested(worktree_id) => {
-                    if let Some(diff) = self.get_diff(worktree_id).await {
-                        if let Err(e) = self.update_diff(worktree_id, &diff.worktree_path).await {
+                    if let Some(worktree_dir) = self.get_worktree_path(worktree_id) {
+                        if let Err(e) = self.update_diff(worktree_id, &worktree_dir).await {
                             error!("Failed to refresh diff for worktree {}: {}", worktree_id, e);
                         }
                     }
@@ -303,3 +348,28 @@ impl Default for DiffTracker {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_diff_status_formatting() {
+        assert_eq!(DiffStatus::Added.to_string(), "A");
+        assert_eq!(DiffStatus::Modified.to_string(), "M");
+        assert_eq!(DiffStatus::Deleted.to_string(), "D");
+        assert_eq!(DiffStatus::Renamed.to_string(), "R");
+        assert_eq!(DiffStatus::Copied.to_string(), "C");
+        assert_eq!(DiffStatus::Untracked.to_string(), "?");
+    }
+
+    #[test]
+    fn test_tracker_sync_queries() {
+        let tracker = DiffTracker::new();
+        let wt_id = uuid::Uuid::new_v4();
+        assert!(tracker.get_diff(wt_id).is_none());
+        assert!(tracker.get_all_diffs().is_empty());
+        assert!(tracker.get_worktree_path(wt_id).is_none());
+    }
+}
+
