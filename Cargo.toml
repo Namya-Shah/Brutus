@@ -7,7 +7,7 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 tokio = { version = "1.38", features = ["full", "rt-multi-thread", "macros", "sync", "process", "fs", "io-util", "signal"] }
-eframe = "0.31"
+eframe = { version = "0.31", features = ["wgpu"] }
 notify = { version = "6.1", features = ["mio"] }
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }

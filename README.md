@@ -6,16 +6,17 @@ A fast, parallel agent IDE and workspace manager written in Rust. Run multiple C
 
 - **Cross-Platform Native Desktop GUI**: Built with `egui` and `eframe` for macOS, Windows, and Linux as a single, lightweight binary with zero web/node runtime dependencies.
 - **Parallel Agent Execution**: Run multiple coding agents simultaneously across isolated Git worktrees.
-- **Real-time Terminal Streaming**: Live stdout/stderr color-coded streaming with auto-scrolling, stdout/stderr filtering, clipboard copy, and interactive stdin prompt.
+- **Floating Terminal**: Move and resize the terminal anywhere within Brutus while browsing other views, with live stdout/stderr color-coded streaming, auto-scrolling, stdout/stderr filtering, clipboard copy, and interactive stdin prompt.
+- **GPU Terminal Rendering**: All agent output shares a wgpu renderer that prefers a high-performance GPU, with only visible log rows laid out each frame. This accelerates terminal drawing; AI model inference uses the backend configured by each agent.
 - **Live Git Diff Tracking**: Continuous `git diff` monitoring with file system watchers, changed file status badges (`[M]`, `[A]`, `[D]`, `[?]`), and colored syntax/diff highlighting.
 - **Git Worktree Lifecycle Management**: Automatic creation, auto-discovery of existing worktrees, direct folder opening in native file managers, and safe cleanup.
 - **Modern Dark IDE Layout**: Multi-pane interface with responsive sidebar, tabs, quick action bars, and modal dialogs.
 
 ## Supported Platforms
 
-- **macOS** (Metal / Cocoa / Glow)
-- **Windows** (DirectX / Win32 / Glow)
-- **Linux** (Wayland / X11 / Glow)
+- **macOS** (wgpu / Metal / Cocoa)
+- **Windows** (wgpu / DirectX 12 / Win32)
+- **Linux** (wgpu / Vulkan / Wayland / X11)
 
 ## Installation & Build
 
@@ -53,13 +54,13 @@ brutus --debug
 
 ## GUI Navigation & Layout
 
-- **Header / App Bar**: Global tabs, quick action buttons (`➕ New Worktree`, `🚀 Spawn Agent`, `🔄 Refresh Diff`, `❓ Shortcuts`), active repository and base branch badge.
+- **Header / App Bar**: Terminal visibility toggle, workspace tabs, quick action buttons (`➕ New Worktree`, `🚀 Spawn Agent`, `🔄 Refresh Diff`, `❓ Shortcuts`), active repository and base branch badge.
 - **Left Sidebar**:
   - Filter / Search bar for worktrees.
   - **Worktrees List**: Active worktrees with status indicators (`Ready`, `Running`, `Failed`, `Creating`), branch names, folder opening, and deletion.
   - **Agents List**: Spawned agents for the selected worktree with status pills and `⏹ Kill` controls.
+- **📟 Floating Terminal**: Drag the title bar to move it anywhere within the app, including over the sidebar, and drag its edges or corners to resize it. The terminal stays open across workspace tabs and remembers its position and size while Brutus is running. Close it with `×` or the header toggle; reopen it with the toggle, `Ctrl/Cmd + 1`, or an agent's terminal action. Includes live output from the selected agent (stdout in bright white/green, stderr in soft red), stdout/stderr filter, auto-scroll toggle, output copy/clear, horizontal scrolling for long lines, and an interactive `> ` stdin bar.
 - **Central Workspace**:
-  - **📟 Terminal Tab**: Live output from the selected agent (stdout in bright white/green, stderr in soft red), stdout/stderr filter, auto-scroll toggle, output copy/clear, and interactive `> ` stdin bar.
   - **🔀 Live Git Diff Tab**: Split view showing changed files (`+Additions`, `-Deletions`, Git status `A/M/D/R/?`) and full colorized diff with syntax highlighting.
   - **📁 Workspaces Tab**: Overview card grid of all git worktrees, branch details, base branches, and disk paths.
   - **🤖 Agents Monitor Tab**: Global table of all active and past agents across all worktrees.
@@ -72,7 +73,7 @@ brutus --debug
 | `Ctrl + N` / `Cmd + N` | Create new Git worktree |
 | `Ctrl + A` / `Cmd + A` | Spawn coding agent in active worktree |
 | `Ctrl + R` / `Cmd + R` | Refresh live git diff |
-| `Ctrl + 1` / `Cmd + 1` | Switch to Terminal tab |
+| `Ctrl + 1` / `Cmd + 1` | Open floating terminal |
 | `Ctrl + 2` / `Cmd + 2` | Switch to Live Git Diff tab |
 | `Ctrl + 3` / `Cmd + 3` | Switch to Workspaces Overview tab |
 | `Ctrl + 4` / `Cmd + 4` | Switch to Agents Monitor tab |

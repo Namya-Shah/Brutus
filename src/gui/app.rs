@@ -10,7 +10,6 @@ use super::theme::Theme;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActiveTab {
-    Terminal,
     Diff,
     Workspaces,
     Agents,
@@ -29,6 +28,7 @@ pub struct BrutusApp {
     pub diff_tracker: Arc<DiffTracker>,
 
     pub active_tab: ActiveTab,
+    pub show_terminal: bool,
     pub selected_worktree: Option<Uuid>,
     pub selected_agent: Option<Uuid>,
     pub selected_diff_file: Option<usize>,
@@ -192,7 +192,8 @@ impl BrutusApp {
             workspace_manager,
             agent_runner,
             diff_tracker,
-            active_tab: ActiveTab::Terminal,
+            active_tab: ActiveTab::Diff,
+            show_terminal: true,
             selected_worktree: first_wt,
             selected_agent: initial_agent,
             selected_diff_file: Some(0),
@@ -251,6 +252,14 @@ impl BrutusApp {
         self.selected_worktree.and_then(|id| self.diff_tracker.get_diff(id))
     }
 
+    fn open_terminal(&mut self, ctx: &egui::Context) {
+        self.show_terminal = true;
+        ctx.move_to_top(egui::LayerId::new(
+            egui::Order::Middle,
+            egui::Id::new("floating_terminal"),
+        ));
+    }
+
     fn check_keyboard_shortcuts(&mut self, ctx: &egui::Context) {
         let input = ctx.input(|i| i.clone());
 
@@ -274,7 +283,7 @@ impl BrutusApp {
         }
 
         if input.modifiers.command && input.key_pressed(egui::Key::Num1) {
-            self.active_tab = ActiveTab::Terminal;
+            self.open_terminal(ctx);
         } else if input.modifiers.command && input.key_pressed(egui::Key::Num2) {
             self.active_tab = ActiveTab::Diff;
         } else if input.modifiers.command && input.key_pressed(egui::Key::Num3) {
@@ -353,6 +362,7 @@ impl eframe::App for BrutusApp {
                 self.render_central_content(ui);
             });
 
+        self.render_terminal_window(ctx);
         self.render_modals(ctx);
     }
 }
@@ -374,8 +384,28 @@ impl BrutusApp {
 
             ui.add_space(14.0);
 
+            if ui
+                .selectable_label(
+                    self.show_terminal,
+                    RichText::new("terminal")
+                        .size(13.0)
+                        .color(if self.show_terminal {
+                            Theme::ACCENT
+                        } else {
+                            Theme::TEXT_MUTED
+                        }),
+                )
+                .on_hover_text("Toggle floating terminal (Ctrl/Cmd+1 to open)")
+                .clicked()
+            {
+                if self.show_terminal {
+                    self.show_terminal = false;
+                } else {
+                    self.open_terminal(ui.ctx());
+                }
+            }
+
             let tabs = [
-                (ActiveTab::Terminal, "terminal"),
                 (ActiveTab::Diff, "diff"),
                 (ActiveTab::Workspaces, "workspaces"),
                 (ActiveTab::Agents, "agents"),
@@ -683,7 +713,7 @@ impl BrutusApp {
 
                             if label.clicked() {
                                 self.selected_agent = Some(agent.id);
-                                self.active_tab = ActiveTab::Terminal;
+                                self.open_terminal(ui.ctx());
                             }
 
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -725,11 +755,32 @@ impl BrutusApp {
 impl BrutusApp {
     fn render_central_content(&mut self, ui: &mut egui::Ui) {
         match self.active_tab {
-            ActiveTab::Terminal => self.render_terminal_view(ui),
             ActiveTab::Diff => self.render_diff_view(ui),
             ActiveTab::Workspaces => self.render_workspaces_overview(ui),
             ActiveTab::Agents => self.render_agents_overview(ui),
         }
+    }
+
+    fn render_terminal_window(&mut self, ctx: &egui::Context) {
+        if !self.show_terminal {
+            return;
+        }
+
+        let mut open = self.show_terminal;
+        egui::Window::new("terminal")
+            .id(egui::Id::new("floating_terminal"))
+            .open(&mut open)
+            .movable(true)
+            .resizable(true)
+            .collapsible(false)
+            .default_pos(ctx.screen_rect().center() - egui::vec2(380.0, 210.0))
+            .default_size(egui::vec2(760.0, 420.0))
+            .min_size(egui::vec2(520.0, 260.0))
+            .constrain_to(ctx.screen_rect())
+            .show(ctx, |ui| {
+                self.render_terminal_view(ui);
+            });
+        self.show_terminal = open;
     }
 
     fn render_terminal_view(&mut self, ui: &mut egui::Ui) {
@@ -768,7 +819,9 @@ impl BrutusApp {
                         .color(Theme::TEXT_DIM),
                 );
             }
+        });
 
+        ui.horizontal(|ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if let Some(ref a) = agent {
                     if ui.add(ghost_button("copy")).clicked() {
@@ -805,82 +858,98 @@ impl BrutusApp {
 
         ui.add_space(4.0);
 
-        let available_size = ui.available_size();
-        let log_height = (available_size.y - 36.0).max(100.0);
-
-        egui::Frame::NONE
+        let log_frame = egui::Frame::NONE
             .fill(Theme::TERM_BG)
             .stroke(Theme::hairline())
             .corner_radius(8.0)
-            .inner_margin(egui::Margin::same(8))
-            .show(ui, |ui| {
-                let lines = if let Some(ref a) = agent {
-                    let all_lines = a.output.get_lines();
-                    match self.log_filter {
-                        LogStreamFilter::All => all_lines,
-                        LogStreamFilter::StdoutOnly => {
-                            all_lines.into_iter().filter(|l| !l.is_stderr).collect()
-                        }
-                        LogStreamFilter::StderrOnly => {
-                            all_lines.into_iter().filter(|l| l.is_stderr).collect()
-                        }
+            .inner_margin(egui::Margin::same(8));
+        let input_height = ui.spacing().interact_size.y.max(
+            ui.text_style_height(&egui::TextStyle::Monospace)
+                + 2.0 * ui.spacing().button_padding.y,
+        );
+        let log_height = (ui.available_height()
+            - log_frame.total_margin().sum().y
+            - input_height
+            - 4.0
+            - 2.0 * ui.spacing().item_spacing.y)
+            .max(0.0);
+
+        log_frame.show(ui, |ui| {
+            let lines = if let Some(ref a) = agent {
+                let all_lines = a.output.get_lines();
+                match self.log_filter {
+                    LogStreamFilter::All => all_lines,
+                    LogStreamFilter::StdoutOnly => {
+                        all_lines.into_iter().filter(|l| !l.is_stderr).collect()
                     }
-                } else {
-                    Vec::new()
-                };
+                    LogStreamFilter::StderrOnly => {
+                        all_lines.into_iter().filter(|l| l.is_stderr).collect()
+                    }
+                }
+            } else {
+                Vec::new()
+            };
 
-                egui::ScrollArea::vertical()
-                    .id_salt("terminal_log_scroll")
-                    .max_height(log_height)
-                    .stick_to_bottom(self.auto_scroll)
-                    .show(ui, |ui| {
-                        if lines.is_empty() {
-                            ui.add_space(12.0);
-                            let msg = if agent.is_none() {
-                                "select an agent or spawn one to view output"
-                            } else {
-                                "no output yet"
-                            };
-                            ui.label(
-                                RichText::new(msg)
-                                    .monospace()
-                                    .size(12.0)
-                                    .color(Theme::TEXT_DIM),
-                            );
+            ui.spacing_mut().item_spacing.y = 1.0;
+            let row_height = ui
+                .fonts(|fonts| fonts.row_height(&egui::FontId::monospace(12.0)))
+                .max(ui.spacing().interact_size.y);
+
+            egui::ScrollArea::both()
+                .id_salt("terminal_log_scroll")
+                .max_height(log_height)
+                .min_scrolled_height(0.0)
+                .auto_shrink([false, false])
+                .stick_to_bottom(self.auto_scroll)
+                .show_rows(ui, row_height, lines.len().max(1), |ui, visible_rows| {
+                    if lines.is_empty() {
+                        let msg = if agent.is_none() {
+                            "select an agent or spawn one to view output"
                         } else {
-                            ui.spacing_mut().item_spacing.y = 1.0;
-                            for line in lines {
-                                let (text_color, bg_color) = if line.is_stderr {
-                                    (Theme::TERM_STDERR, Theme::STDERR_BG)
-                                } else {
-                                    (Theme::TERM_STDOUT, Color32::TRANSPARENT)
-                                };
+                            "no output yet"
+                        };
+                        ui.label(
+                            RichText::new(msg)
+                                .monospace()
+                                .size(12.0)
+                                .color(Theme::TEXT_DIM),
+                        );
+                    } else {
+                        for line in &lines[visible_rows] {
+                            let (text_color, bg_color) = if line.is_stderr {
+                                (Theme::TERM_STDERR, Theme::STDERR_BG)
+                            } else {
+                                (Theme::TERM_STDOUT, Color32::TRANSPARENT)
+                            };
 
-                                let time_str = line.timestamp.format("%H:%M:%S").to_string();
+                            let time_str = line.timestamp.format("%H:%M:%S").to_string();
 
-                                egui::Frame::NONE
-                                    .fill(bg_color)
-                                    .inner_margin(egui::Margin::symmetric(2, 0))
-                                    .show(ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            ui.label(
-                                                RichText::new(time_str)
-                                                    .monospace()
-                                                    .size(11.0)
-                                                    .color(Theme::TERM_TIMESTAMP),
-                                            );
-                                            ui.label(
-                                                RichText::new(line.text)
+                            egui::Frame::NONE
+                                .fill(bg_color)
+                                .inner_margin(egui::Margin::symmetric(2, 0))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            RichText::new(time_str)
+                                                .monospace()
+                                                .size(11.0)
+                                                .color(Theme::TERM_TIMESTAMP),
+                                        );
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(&line.text)
                                                     .monospace()
                                                     .size(12.0)
                                                     .color(text_color),
-                                            );
-                                        });
+                                            )
+                                            .extend(),
+                                        );
                                     });
-                            }
+                                });
                         }
-                    });
-            });
+                    }
+                });
+        });
 
         ui.add_space(4.0);
 
@@ -1360,7 +1429,7 @@ impl BrutusApp {
                                 if ui.add(ghost_button("term")).clicked() {
                                     self.selected_worktree = Some(agent.worktree_id);
                                     self.selected_agent = Some(agent.id);
-                                    self.active_tab = ActiveTab::Terminal;
+                                    self.open_terminal(ui.ctx());
                                 }
                             });
                         });
@@ -1598,7 +1667,7 @@ impl BrutusApp {
 
                                 self.set_status(format!("spawned {}", agent_t), false);
                                 self.selected_worktree = Some(wt_id);
-                                self.active_tab = ActiveTab::Terminal;
+                                self.open_terminal(ui.ctx());
                                 self.show_spawn_agent_modal = false;
                             }
                         }
@@ -1702,7 +1771,7 @@ impl BrutusApp {
                         ("ctrl/cmd+n", "new worktree"),
                         ("ctrl/cmd+a", "spawn agent"),
                         ("ctrl/cmd+r", "refresh diff"),
-                        ("ctrl/cmd+1", "terminal"),
+                        ("ctrl/cmd+1", "open floating terminal"),
                         ("ctrl/cmd+2", "diff"),
                         ("ctrl/cmd+3", "workspaces"),
                         ("ctrl/cmd+4", "agents"),
@@ -1739,6 +1808,16 @@ impl BrutusApp {
 
 pub fn run_gui(app: BrutusApp) -> anyhow::Result<()> {
     let native_options = eframe::NativeOptions {
+        renderer: eframe::Renderer::Wgpu,
+        wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
+            desired_maximum_frame_latency: Some(1),
+            wgpu_setup: eframe::egui_wgpu::WgpuSetupCreateNew {
+                power_preference: eframe::wgpu::PowerPreference::HighPerformance,
+                ..Default::default()
+            }
+            .into(),
+            ..Default::default()
+        },
         viewport: egui::ViewportBuilder::default()
             .with_title("brutus")
             .with_inner_size([1280.0, 820.0])
@@ -1750,6 +1829,15 @@ pub fn run_gui(app: BrutusApp) -> anyhow::Result<()> {
         "brutus",
         native_options,
         Box::new(|cc| {
+            if let Some(render_state) = &cc.wgpu_render_state {
+                let adapter = render_state.adapter.get_info();
+                tracing::info!(
+                    "Terminal renderer: wgpu / {:?} on {} ({:?})",
+                    adapter.backend,
+                    adapter.name,
+                    adapter.device_type,
+                );
+            }
             Theme::apply(&cc.egui_ctx);
             Ok(Box::new(app))
         }),
